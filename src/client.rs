@@ -12,7 +12,7 @@ use std::str;
 use std::sync::mpsc;
 
 use super::authenticator::Authenticator;
-use super::error::{Error, ParseError, Result, ValidateError};
+use super::error::{Error, ParseError, Result, TagMismatch, ValidateError};
 use super::extensions;
 use super::parse::*;
 use super::types::*;
@@ -38,6 +38,44 @@ impl<E> OptionExt<E> for Option<E> {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+}
+
+/// Whether `line` announces a literal: what follows is `{N}` bytes of data, not more lines.
+fn ends_in_literal(line: &[u8]) -> bool {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let digits = match line.strip_suffix(b"}") {
+        Some(digits) => digits,
+        None => return false,
+    };
+    match digits.iter().rposition(|b| !b.is_ascii_digit()) {
+        Some(brace) => digits[brace] == b'{' && brace + 1 < digits.len(),
+        None => false,
+    }
+}
+
+/// What a line the parser refused means for the response being read.
+enum RejectedLine {
+    /// An untagged line: the tagged completion is still to come.
+    Untagged,
+    /// The tagged completion itself: the response is over.
+    Completion,
+    /// A literal's announcement or a line that is no response at all: what comes next on the
+    /// stream can be message text, which must never be read as server responses.
+    OutOfStep,
+}
+
+fn classify_rejected(line: &[u8], match_tag: &str) -> RejectedLine {
+    if ends_in_literal(line) {
+        return RejectedLine::OutOfStep;
+    }
+    if line.starts_with(b"*") {
+        return RejectedLine::Untagged;
+    }
+    match line.split(|b| *b == b' ' || *b == CR).next() {
+        Some(tag) if tag == match_tag.as_bytes() => RejectedLine::Completion,
+        _ => RejectedLine::OutOfStep,
     }
 }
 
@@ -134,6 +172,9 @@ pub struct Client<T: Read + Write> {
 pub struct Connection<T: Read + Write> {
     pub(crate) stream: BufStream<T>,
     tag: u32,
+
+    /// The stream is no longer in step with the server, so no further command goes out.
+    desynced: bool,
 
     /// Enable debug mode for this connection so that all client-server interactions are printed to
     /// `STDERR`.
@@ -328,6 +369,7 @@ impl<T: Read + Write> Client<T> {
             conn: Connection {
                 stream: BufStream::new(stream),
                 tag: INITIAL_TAG,
+                desynced: false,
                 debug: false,
                 greeting_read: false,
             },
@@ -1323,6 +1365,9 @@ impl<T: Read + Write> Connection<T> {
     }
 
     fn run_command(&mut self, untagged_command: &str) -> Result<()> {
+        if self.desynced {
+            return Err(Error::ConnectionLost);
+        }
         let command = self.create_command(untagged_command);
         self.write_line(command.into_bytes().as_slice())
     }
@@ -1366,7 +1411,18 @@ impl<T: Read + Write> Connection<T> {
                             ..
                         },
                     )) => {
-                        assert_eq!(tag.as_bytes(), match_tag.as_bytes());
+                        if tag.as_bytes() != match_tag.as_bytes() {
+                            let actual = tag
+                                .0
+                                .trim_start_matches(TAG_PREFIX)
+                                .parse::<u32>()
+                                .map_err(|_| tag.as_bytes().to_vec());
+                            self.desynced = true;
+                            break Err(Error::TagMismatch(TagMismatch {
+                                expect: self.tag,
+                                actual,
+                            }));
+                        }
                         Some(match status {
                             Status::Bad | Status::No => {
                                 Err((status, information.map(ToString::to_string)))
@@ -1380,7 +1436,16 @@ impl<T: Read + Write> Connection<T> {
                         continue_from = Some(line_start);
                         None
                     }
-                    _ => Some(Err((Status::Bye, None))),
+                    Err(_) => match classify_rejected(line, &match_tag) {
+                        // Stays in `data`: a raw reader can still use it, and a typed command
+                        // reports it rather than answering without it.
+                        RejectedLine::Untagged => None,
+                        RejectedLine::Completion => Some(Err((Status::Bye, None))),
+                        RejectedLine::OutOfStep => {
+                            self.desynced = true;
+                            Some(Err((Status::Bye, None)))
+                        }
+                    },
                 }
             };
 
@@ -1402,7 +1467,11 @@ impl<T: Read + Write> Connection<T> {
                                 expl.unwrap_or_else(|| "no explanation given".to_string()),
                             ));
                         }
-                        _ => break Err(Error::Parse(ParseError::Invalid(data.split_off(0)))),
+                        _ => {
+                            break Err(Error::Parse(ParseError::Invalid(
+                                data.split_off(line_start),
+                            )));
+                        }
                     }
                 }
                 None => {}
@@ -2025,5 +2094,251 @@ mod tests {
             panic!("Wrong error: {:?}", e);
         }
         panic!("No error");
+    }
+
+    // A server line the parser refuses must leave the session in step with the server. See
+    // https://github.com/jonhoo/rust-imap/issues/211.
+
+    /// What `imap-proto` 0.10 refuses and a real server can send in the middle of a response.
+    const REJECTED_UNTAGGED_LINES: &[&str] = &[
+        "* SEARCH 1 2 3 \r\n",
+        "* SEARCH \r\n",
+        "* OK\r\n",
+        "* NO\r\n",
+        "* BYE\r\n",
+        "*\r\n",
+        "* LIST (\\Noselect)  \"/\" INBOX\r\n",
+        "* LIST () \"/\" Foo Bar\r\n",
+        "* XLIST () \"/\" INBOX\r\n",
+        "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n",
+        "* ID (\"name\" \"x\")\r\n",
+        "* CAPABILITY AUTH=PLAIN IDLE\r\n",
+        "* XFOO bar baz\r\n",
+        "* 1 XFOO\r\n",
+        "* 1 EXPUNGE \r\n",
+        "* 1 FETCH (FLAGS (\\Seen)\r\n",
+    ];
+
+    fn assert_rejected<T: std::fmt::Debug>(result: Result<T>, expected_line: &str) {
+        match result {
+            Err(Error::Parse(ParseError::Invalid(line))) => {
+                assert_eq!(String::from_utf8_lossy(&line), expected_line)
+            }
+            other => panic!(
+                "expected {:?} to be rejected, got {:?}",
+                expected_line, other
+            ),
+        }
+    }
+
+    fn assert_refuses_commands<T: Read + Write>(session: &mut Session<T>) {
+        match session.noop() {
+            Err(Error::ConnectionLost) => {}
+            other => panic!("expected the session to refuse a command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capability_reply_without_imap4rev1_does_not_derail_the_next_command() {
+        // LOGIN, LIST, CAPABILITY, EXAMINE: the sequence behind the panic on `a3` vs `a4`.
+        let response = b"a1 OK logged in\r\n\
+            a2 OK listed\r\n\
+            * CAPABILITY AUTH=PLAIN IDLE\r\n\
+            a3 OK done\r\n\
+            * OK [UIDVALIDITY 7] ok\r\n\
+            a4 OK opened\r\n"
+            .to_vec();
+        let mut session = Client::new(MockStream::new(response))
+            .login("u", "p")
+            .unwrap();
+        session.list(None, Some("*")).unwrap();
+
+        match session.capabilities() {
+            Err(Error::Parse(ParseError::Invalid(_))) => {}
+            Err(e) => panic!("wrong error: {:?}", e),
+            Ok(_) => panic!("a reply without IMAP4rev1 parsed"),
+        }
+
+        let examined = session
+            .run_command_and_read_response("EXAMINE \"INBOX\"")
+            .unwrap();
+        assert_eq!(examined, b"* OK [UIDVALIDITY 7] ok\r\n".to_vec());
+    }
+
+    #[test]
+    fn rejected_untagged_line_stays_in_a_raw_response_and_the_session_in_step() {
+        for line in REJECTED_UNTAGGED_LINES {
+            let response = format!("{}a1 OK done\r\na2 OK next\r\n", line);
+            let mut session = mock_session!(MockStream::new(response.into_bytes()));
+
+            let raw = session.run_command_and_read_response("NOOP").unwrap();
+            assert_eq!(String::from_utf8_lossy(&raw), *line);
+
+            let next = session.run_command_and_read_response("NOOP").unwrap();
+            assert!(next.is_empty(), "after {:?}", line);
+        }
+    }
+
+    #[test]
+    fn typed_command_reports_a_rejected_line_instead_of_a_partial_result() {
+        let response = b"* SEARCH 1 2 3 \r\na1 OK done\r\na2 OK next\r\n".to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+
+        assert_rejected(session.search("ALL"), "* SEARCH 1 2 3 \r\n");
+
+        session.noop().unwrap();
+    }
+
+    #[test]
+    fn tagged_completion_the_parser_rejects_ends_the_response() {
+        for line in &["a1 OK\r\n", "a1 NO\r\n", "a1 BAD\r\n", "a1 FOO bar\r\n"] {
+            let response = format!("{}a2 OK next\r\n", line);
+            let mut session = mock_session!(MockStream::new(response.into_bytes()));
+
+            assert_rejected(session.run_command_and_read_response("NOOP"), line);
+
+            session.noop().unwrap();
+        }
+    }
+
+    #[test]
+    fn line_that_is_neither_untagged_nor_ours_stops_the_session() {
+        for line in &["hello there\r\n", "\r\n", "a11 OK\r\n"] {
+            let response = format!("{}a1 OK done\r\n", line);
+            let mut session = mock_session!(MockStream::new(response.into_bytes()));
+
+            assert_rejected(session.run_command_and_read_response("NOOP"), line);
+
+            assert_refuses_commands(&mut session);
+            assert_eq!(
+                session.stream.get_ref().written_buf,
+                b"a1 NOOP\r\n".to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_line_ending_in_a_literal_does_not_read_the_literal_as_commands() {
+        // The literal is message text, so it must not be able to complete a command.
+        let literal = "a1 OK in the body\r\n)\r\na1 OK done\r\n";
+        for line in &[
+            "* XFOO {19}\r\n",
+            "* 1 XFOO ~{19}\r\n",
+            "* 1 FETCH (FLAGS (\\Seen) XFOO BODY[] {19}\r\n",
+            "* 1 FETCH (BODY[] {5}\r\nhello BAD[ {19}\r\n",
+        ] {
+            let response = format!("{}{}", line, literal);
+            let mut session = mock_session!(MockStream::new(response.into_bytes()));
+
+            assert_rejected(session.run_command_and_read_response("NOOP"), line);
+
+            assert_refuses_commands(&mut session);
+            assert_eq!(
+                session.stream.get_ref().written_buf,
+                b"a1 NOOP\r\n".to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn literal_marker_is_a_brace_number_at_the_end_of_the_line() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"* XFOO {5}\r\n", true),
+            (b"* XFOO {5}\n", true),
+            (b"* XFOO ~{5}\r\n", true),
+            (b"* XFOO {}\r\n", false),
+            (b"* XFOO {5x}\r\n", false),
+            (b"* XFOO {5} \r\n", false),
+            (b"* XFOO 5}\r\n", false),
+            (b"* XFOO {5} bar\r\n", false),
+            (b"* XFOO\r\n", false),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                ends_in_literal(line),
+                *expected,
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_tag_is_an_error_and_stops_the_session() {
+        let mock_stream = MockStream::new(b"a0 OK stale\r\n".to_vec());
+        let mut session = mock_session!(mock_stream);
+
+        match session.noop() {
+            Err(Error::TagMismatch(TagMismatch {
+                expect: 1,
+                actual: Ok(0),
+            })) => {}
+            other => panic!("wrong outcome: {:?}", other),
+        }
+
+        assert_refuses_commands(&mut session);
+        assert_eq!(
+            session.stream.get_ref().written_buf,
+            b"a1 NOOP\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn tag_of_someone_else_is_an_error() {
+        let mock_stream = MockStream::new(b"A1 OK done\r\n".to_vec());
+        let mut session = mock_session!(mock_stream);
+
+        match session.noop() {
+            Err(Error::TagMismatch(TagMismatch {
+                expect: 1,
+                actual: Err(ref tag),
+            })) if tag == b"A1" => {}
+            other => panic!("wrong outcome: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tag_mismatch_prints_numbers_only() {
+        let numbered = Error::TagMismatch(TagMismatch {
+            expect: 4,
+            actual: Ok(3),
+        });
+        assert_eq!(
+            numbered.to_string(),
+            "Mismatched tag: expected tag 4, got tag 3"
+        );
+
+        let text = Error::TagMismatch(TagMismatch {
+            expect: 4,
+            actual: Err(b"private".to_vec()),
+        });
+        assert_eq!(
+            text.to_string(),
+            "Mismatched tag: expected tag 4, got another tag"
+        );
+    }
+
+    #[test]
+    fn untagged_warning_or_goodbye_during_select_does_not_panic() {
+        for line in &["* NO warning\r\n", "* BAD oops\r\n", "* BYE leaving\r\n"] {
+            let response = format!("{}* 3 EXISTS\r\na1 OK done\r\n", line);
+            let mut session = mock_session!(MockStream::new(response.into_bytes()));
+
+            let mailbox = session.select("INBOX").unwrap();
+
+            assert_eq!(mailbox.exists, 3, "after {:?}", line);
+        }
+    }
+
+    #[test]
+    fn idle_completed_without_a_continuation_is_an_error() {
+        let mock_stream = MockStream::new(b"a1 OK done\r\n".to_vec());
+        let mut session = mock_session!(mock_stream);
+
+        match session.idle() {
+            Err(Error::Parse(ParseError::Unexpected(_))) => {}
+            Err(e) => panic!("wrong error: {:?}", e),
+            Ok(_) => panic!("IDLE started without a continuation"),
+        };
     }
 }

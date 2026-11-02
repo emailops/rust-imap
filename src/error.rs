@@ -43,8 +43,32 @@ pub enum Error {
     Validate(ValidateError),
     /// Error appending an e-mail.
     Append,
+    /// The server completed a different command than the one we just sent.
+    ///
+    /// The session no longer matches the server, so it refuses further commands. Open a new one.
+    TagMismatch(TagMismatch),
     #[doc(hidden)]
     __Nonexhaustive,
+}
+
+/// The tags of a [`Error::TagMismatch`].
+#[derive(Debug)]
+pub struct TagMismatch {
+    /// The number in the tag we sent.
+    pub expect: u32,
+    /// The number in the tag the server sent, or the tag itself if it has none.
+    pub actual: result::Result<u32, Vec<u8>>,
+}
+
+impl fmt::Display for TagMismatch {
+    // A stream that is out of step can put message text where a tag belongs, so only numbers are
+    // printed: this string ends up in logs.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.actual {
+            Ok(actual) => write!(f, "expected tag {}, got tag {}", self.expect, actual),
+            Err(_) => write!(f, "expected tag {}, got another tag", self.expect),
+        }
+    }
 }
 
 impl From<IoError> for Error {
@@ -99,6 +123,7 @@ impl fmt::Display for Error {
             Error::Bad(ref data) => write!(f, "Bad Response: {}", data),
             Error::ConnectionLost => f.write_str("Connection Lost"),
             Error::Append => f.write_str("Could not append mail to mailbox"),
+            Error::TagMismatch(ref e) => write!(f, "Mismatched tag: {}", e),
             Error::__Nonexhaustive => f.write_str("Unknown"),
         }
     }
@@ -119,6 +144,7 @@ impl StdError for Error {
             Error::No(_) => "No Response",
             Error::ConnectionLost => "Connection lost",
             Error::Append => "Could not append mail to mailbox",
+            Error::TagMismatch(_) => "Mismatched tag",
             Error::__Nonexhaustive => "Unknown",
         }
     }

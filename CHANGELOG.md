@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## emailops/2.4-panic-free
+Fork of 2.4.1 kept for [EmailOps](https://github.com/emailops/emailops): `main` is the 3.0 alpha
+line, and upstream's fix for the first item below only landed there.
+
+### Changed
+- A completion for another command returns `Error::TagMismatch` instead of panicking
+  ([#284](https://github.com/jonhoo/rust-imap/pull/284)). The number-only `Display` and refusing
+  later commands are specific to this branch.
+- An untagged line the parser rejects no longer abandons the response
+  ([#211](https://github.com/jonhoo/rust-imap/issues/211)). It stays in the raw response, the rest
+  of the response is read, and a typed command returns `Error::Parse` once the session is back in
+  step.
+- A rejected line that announces a literal, or that is no IMAP response at all, ends the response
+  and the session: what follows can be message text, so later commands return
+  `Error::ConnectionLost` without writing to the stream.
+- `Error::Parse(ParseError::Invalid)` from reading a response starts at the rejected line.
+- An untagged `NO`, `BAD` or `BYE` during `SELECT` or `EXAMINE`, and a tagged completion of `IDLE`
+  without a continuation, no longer reach `unreachable!()`.
+
 ## [2.4.1] - 2021-01-12
 ### Changed
 

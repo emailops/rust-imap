@@ -204,29 +204,27 @@ pub fn parse_mailbox(
             Ok((rest, Response::Data { status, code, .. })) => {
                 lines = rest;
 
+                // An untagged NO is a warning, an untagged BAD names no command and a BYE shows up
+                // on the next read (RFC 3501 section 7.1): none of them ends this response.
                 if let imap_proto::Status::Ok = status {
-                } else {
-                    // how can this happen for a Response::Data?
-                    unreachable!();
-                }
-
-                use imap_proto::ResponseCode;
-                match code {
-                    Some(ResponseCode::UidValidity(uid)) => {
-                        mailbox.uid_validity = Some(uid);
+                    use imap_proto::ResponseCode;
+                    match code {
+                        Some(ResponseCode::UidValidity(uid)) => {
+                            mailbox.uid_validity = Some(uid);
+                        }
+                        Some(ResponseCode::UidNext(unext)) => {
+                            mailbox.uid_next = Some(unext);
+                        }
+                        Some(ResponseCode::Unseen(n)) => {
+                            mailbox.unseen = Some(n);
+                        }
+                        Some(ResponseCode::PermanentFlags(flags)) => {
+                            mailbox
+                                .permanent_flags
+                                .extend(flags.into_iter().map(String::from).map(Flag::from));
+                        }
+                        _ => {}
                     }
-                    Some(ResponseCode::UidNext(unext)) => {
-                        mailbox.uid_next = Some(unext);
-                    }
-                    Some(ResponseCode::Unseen(n)) => {
-                        mailbox.unseen = Some(n);
-                    }
-                    Some(ResponseCode::PermanentFlags(flags)) => {
-                        mailbox
-                            .permanent_flags
-                            .extend(flags.into_iter().map(String::from).map(Flag::from));
-                    }
-                    _ => {}
                 }
             }
             Ok((rest, Response::MailboxData(m))) => {
