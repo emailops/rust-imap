@@ -1,0 +1,21 @@
+# Builds and tests emailops/2.4-panic-free on every push and pull request,
+# Dependabot's included, so a dependency bump arrives with a verdict.
+name: CI
+
+on:
+  push:
+    branches: [emailops/2.4-panic-free]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The suite in tests/ needs a live IMAP server; the library's own tests do not.
+      - run: cargo test --lib

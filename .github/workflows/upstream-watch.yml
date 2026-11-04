@@ -1,0 +1,27 @@
+# Weekly look at jonhoo/rust-imap. When its main or a tag has moved past
+# .github/upstream-reviewed, opens (or refreshes) the "upstream-watch" pull
+# request listing what changed. See .github/scripts/upstream-watch.sh.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-watch
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - run: bash .github/scripts/upstream-watch.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
