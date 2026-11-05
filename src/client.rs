@@ -1,4 +1,6 @@
-use base64;
+use base64::alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::{DecodePaddingMode, Engine};
 use bufstream::BufStream;
 use chrono::{DateTime, FixedOffset};
 #[cfg(feature = "tls")]
@@ -21,6 +23,14 @@ static TAG_PREFIX: &str = "a";
 const INITIAL_TAG: u32 = 0;
 const CR: u8 = 0x0d;
 const LF: u8 = 0x0a;
+
+/// base64 the way 0.13's `STANDARD` did it: padded on the way out, padding
+/// optional on the way in. From 0.20 the preset engines reject a server
+/// challenge that leaves its padding off.
+const BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 macro_rules! quote {
     ($x:expr) => {
@@ -508,17 +518,14 @@ impl<T: Read + Write> Client<T> {
                     );
                     let data =
                         ok_or_unauth_client_err!(parse_authenticate_response(line_str), self);
-                    ok_or_unauth_client_err!(
-                        base64::decode(data).map_err(|e| Error::Parse(ParseError::Authentication(
-                            data.to_string(),
-                            Some(e)
-                        ))),
-                        self
-                    )
+                    let decoded = BASE64.decode(data).map_err(|e| {
+                        Error::Parse(ParseError::Authentication(data.to_string(), Some(e)))
+                    });
+                    ok_or_unauth_client_err!(decoded, self)
                 };
 
                 let raw_response = &authenticator.process(&challenge);
-                let auth_response = base64::encode(raw_response);
+                let auth_response = BASE64.encode(raw_response);
                 ok_or_unauth_client_err!(
                     self.write_line(auth_response.into_bytes().as_slice()),
                     self
@@ -1631,6 +1638,45 @@ mod tests {
         assert!(
             session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
             "Invalid authenticate command"
+        );
+    }
+
+    #[test]
+    fn authenticate_accepts_a_challenge_without_padding() {
+        // "YmFyYg" is "barb" without its "==". base64 0.13 accepted it; 0.20 and
+        // later reject it unless the engine is told padding does not matter.
+        let response = b"+ YmFyYg\r\n\
+                         a1 OK Logged in\r\n"
+            .to_vec();
+        let client = Client::new(MockStream::new(response));
+        struct Barb;
+        impl Authenticator for Barb {
+            type Response = Vec<u8>;
+            fn process(&self, challenge: &[u8]) -> Self::Response {
+                assert_eq!(challenge, b"barb");
+                b"foo".to_vec()
+            }
+        }
+        client.authenticate("PLAIN", &Barb).unwrap();
+    }
+
+    #[test]
+    fn authenticate_pads_the_response() {
+        let response = b"+ YmFy\r\n\
+                         a1 OK Logged in\r\n"
+            .to_vec();
+        let client = Client::new(MockStream::new(response));
+        struct Foob;
+        impl Authenticator for Foob {
+            type Response = Vec<u8>;
+            fn process(&self, _challenge: &[u8]) -> Self::Response {
+                b"foob".to_vec()
+            }
+        }
+        let session = client.authenticate("PLAIN", &Foob).unwrap();
+        assert_eq!(
+            session.stream.get_ref().written_buf,
+            b"a1 AUTHENTICATE PLAIN\r\nZm9vYg==\r\n".to_vec()
         );
     }
 
